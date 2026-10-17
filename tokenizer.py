@@ -6,12 +6,13 @@ This version adds:
 - optional phrase (n-gram) extraction and registration
 - per-word weight multipliers and repeat-based weighting
 - export includes categories, weights, and phrase flags
+- deterministic scoring engine (pre-AI): per-category buckets, raw and normalized score (0..100)
+- phrase frequency counters and an :ingest command to update them from a directory of resumes
 
 Run:
-    python tokenizer.py
-    python tokenizer.py --words words.txt --degrees degrees.json --categories categories.json --weights weights.json --vocab vocab.json --phrases --min-ngram 2 --max-ngram 4 --repeat-bonus 0.1 --phrase-boost 1.5
+    python tokenizer.py --words words.txt --degrees degrees.json --categories categories.json --weights weights.json --vocab vocab.json --phrases --min-ngram 2 --max-ngram 4
 
-Interactive commands: :help :stats :words :lexicon :save :export PATH :quit
+Interactive commands: :help :stats :words :lexicon :save :export PATH :ingest PATH :score :quit
 """
 
 import argparse
@@ -21,7 +22,7 @@ import re
 import string
 import sys
 from dataclasses import dataclass, field
-from collections import Counter
+from collections import Counter, defaultdict
 
 MIN_DEGREE, MAX_DEGREE = -3, 3
 PAD = "<PAD>"
@@ -60,7 +61,7 @@ class Encoding:
     char_ids: list                      # every character of the input, in order
     words: list = field(default_factory=list)  # list[WordToken]
     total_value: float = 0.0            # weighted sum of token values
-    total_degree: float = 0             # sum of token degrees (weighted by weight)
+    total_degree: int = 0               # sum of token degrees (weighted by weight)
     new_words: int = 0                  # words registered during this call
 
     def to_ai_payload(self):
@@ -99,6 +100,8 @@ class Tokenizer:
         self.max_ngram = 4
         self.repeat_bonus = 0.1
         self.phrase_boost = 1.5
+        # phrase frequency counters persisted by user --phrase-freq
+        self.phrase_freq = Counter()
         for ch in BASE_CHARS:
             self.char_id(ch)
 
@@ -193,6 +196,24 @@ class Tokenizer:
             json.dump(rows, f, ensure_ascii=False, indent=2)
         return len(rows)
 
+    # ---- phrase frequency persistence ----
+    def load_phrase_freq(self, path):
+        if not os.path.exists(path):
+            self.phrase_freq = Counter()
+            return
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        self.phrase_freq = Counter({k: int(v) for k, v in data.items()})
+
+    def save_phrase_freq(self, path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(dict(self.phrase_freq), f, ensure_ascii=False, indent=2)
+
+    def update_phrase_freq_from_encoding(self, enc):
+        for w in enc.words:
+            if w.is_phrase:
+                self.phrase_freq[w.text] += 1
+
     # ---- encoding ----
     def encode(self, text, *, phrases=None, min_ngram=None, max_ngram=None, repeat_bonus=None, phrase_boost=None):
         """Encode text into character ids and word/phrase tokens. Returns Encoding.
@@ -275,6 +296,59 @@ class Tokenizer:
         enc.total_degree = total_degree
         return enc
 
+    # ---- deterministic scoring (pre-AI) ----
+    def score_encoding(self, enc, *, max_value=1000.0, max_degree=50.0):
+        """Compute deterministic score from an Encoding.
+
+        Returns a dict with:
+          - per_category: {category: value}
+          - raw_value: float (sum of weighted token values)
+          - raw_degree: int
+          - category_breakdown: list of (category, value)
+          - normalized_score: 0..100 (clipped)
+
+        Normalization uses max_value and max_degree as expected maxima; these are heuristics
+        you can tune as you gather data. If you want percentile calibration from real data,
+        collect observed maxima and fit later.
+        """
+        # per-category accumulation
+        per_cat = defaultdict(float)
+        uncategorized = 0.0
+        for w in enc.words:
+            val = w.value * w.weight
+            cats = self.categories.get(w.text, [])
+            if cats:
+                share = val / len(cats)
+                for c in cats:
+                    per_cat[c] += share
+            else:
+                uncategorized += val
+
+        # raw totals
+        raw_value = float(enc.total_value)
+        raw_degree = int(enc.total_degree)
+
+        # combine into a simple heuristic score: weighted sum of normalized value and degree
+        v_score = max(0.0, min(1.0, raw_value / float(max_value)))
+        d_score = max(-1.0, min(1.0, raw_degree / float(max_degree)))  # degree can be negative
+        # map degree score (-1..1) to (0..1) where negative degrees reduce score
+        d_score_mapped = (d_score + 1.0) / 2.0
+
+        # combine with tunable weights
+        VALUE_WEIGHT = 0.8
+        DEGREE_WEIGHT = 0.2
+        combined = VALUE_WEIGHT * v_score + DEGREE_WEIGHT * d_score_mapped
+        normalized = max(0.0, min(100.0, combined * 100.0))
+
+        return {
+            "per_category": dict(per_cat),
+            "uncategorized": uncategorized,
+            "raw_value": raw_value,
+            "raw_degree": raw_degree,
+            "normalized_score": normalized,
+            "category_breakdown": sorted(per_cat.items(), key=lambda kv: -kv[1]),
+        }
+
     # ---- persistence ----
     def save(self, path):
         data = {
@@ -339,8 +413,33 @@ def show(enc):
     print()
 
 
+def ingest_directory(tok: Tokenizer, path: str, *, phrases=True, min_ngram=None, max_ngram=None, phrase_freq_path=None):
+    """Process all .txt files under path, update phrase frequency counters, and return number of files processed."""
+    if not os.path.isdir(path):
+        raise ValueError("ingest path must be a directory")
+    min_n = min_ngram if min_ngram is not None else tok.min_ngram
+    max_n = max_ngram if max_ngram is not None else tok.max_ngram
+    files = 0
+    for root, _, filenames in os.walk(path):
+        for fn in filenames:
+            if not fn.lower().endswith(".txt"):
+                continue
+            fp = os.path.join(root, fn)
+            try:
+                with open(fp, encoding="utf-8") as f:
+                    text = f.read()
+            except Exception:
+                continue
+            enc = tok.encode(text, phrases=phrases, min_ngram=min_n, max_ngram=max_n)
+            tok.update_phrase_freq_from_encoding(enc)
+            files += 1
+    if phrase_freq_path:
+        tok.save_phrase_freq(phrase_freq_path)
+    return files
+
+
 def main():
-    p = argparse.ArgumentParser(description="Character + word token library with phrase and weighting support")
+    p = argparse.ArgumentParser(description="Character + word token library with phrase, weighting, and deterministic scoring support")
     p.add_argument("--words", help="word list file, one word per line")
     p.add_argument("--degrees", help="JSON of word -> degree (-3..+3)")
     p.add_argument("--categories", help="JSON of word -> category or [categories]")
@@ -352,6 +451,8 @@ def main():
     p.add_argument("--max-ngram", type=int, default=4, help="maximum n for phrase extraction (default 4)")
     p.add_argument("--repeat-bonus", type=float, default=0.1, help="repeat word bonus multiplier per extra occurrence (default 0.1)")
     p.add_argument("--phrase-boost", type=float, default=1.5, help="phrase value boost multiplier (default 1.5)")
+    p.add_argument("--phrase-freq", help="path to phrase frequency JSON file to load/save (default phrase_freq.json)")
+    p.add_argument("--ingest", help="path to directory of .txt resumes to ingest phrase frequencies from")
     args = p.parse_args()
 
     try:
@@ -382,11 +483,20 @@ def main():
     tok.repeat_bonus = args.repeat_bonus
     tok.phrase_boost = args.phrase_boost
 
+    phrase_freq_path = args.phrase_freq or "phrase_freq.json"
+    # load phrase freq counters if present
+    tok.load_phrase_freq(phrase_freq_path)
+
+    if args.ingest:
+        processed = ingest_directory(tok, args.ingest, phrases=tok.phrases_enabled, min_ngram=tok.min_ngram, max_ngram=tok.max_ngram, phrase_freq_path=phrase_freq_path)
+        print(f"Ingested {processed} files from {args.ingest} and updated {phrase_freq_path}")
+
     if args.export:
         count = tok.export_word_db(args.export)
         print(f"Exported {count} words to {args.export}")
 
-    print("Token library ready. :help :stats :words :lexicon :save :export PATH :quit\n")
+    print("Token library ready. :help :stats :words :lexicon :ingest PATH :save :export PATH :score :quit\n")
+    last_encoding = None
     while True:
         try:
             text = input("> ")
@@ -401,13 +511,20 @@ def main():
             print("  :stats        show vocabulary stats")
             print("  :words        list vocabulary entries")
             print("  :lexicon      list degree mappings")
+            print("  :ingest PATH  ingest all .txt files under PATH and update phrase frequencies")
             print("  :save         write vocab file (requires --vocab)")
             print("  :export PATH  export the current word database to JSON")
+            print("  :score        show deterministic score for last entered text")
             print("  :quit         exit\n")
             continue
         if cmd == ":stats":
             for k, v in tok.stats().items():
                 print(f"  {k}: {v}")
+            if tok.phrase_freq:
+                top = tok.phrase_freq.most_common(10)
+                print("\n  Top phrases (from phrase_freq):")
+                for p, c in top:
+                    print(f"    {p}: {c}")
             print()
             continue
         if cmd == ":words":
@@ -429,12 +546,24 @@ def main():
                 print(f"  {w:<20} {v:+d}")
             print()
             continue
+        if cmd.startswith(":ingest "):
+            path = cmd[len(":ingest "):].strip()
+            if not path:
+                print("  Usage: :ingest PATH\n")
+                continue
+            try:
+                processed = ingest_directory(tok, path, phrases=tok.phrases_enabled, min_ngram=tok.min_ngram, max_ngram=tok.max_ngram, phrase_freq_path=phrase_freq_path)
+                print(f"  Ingested {processed} files from {path} and updated {phrase_freq_path}\n")
+            except Exception as e:
+                print(f"  Could not ingest: {e}\n")
+            continue
         if cmd == ":save":
             if not args.vocab:
                 print("  Start with --vocab path.json to enable saving.\n")
             else:
                 tok.save(args.vocab)
-                print(f"  Saved to {args.vocab}\n")
+                tok.save_phrase_freq(phrase_freq_path)
+                print(f"  Saved to {args.vocab} and phrase freq to {phrase_freq_path}\n")
             continue
         if cmd.startswith(":export "):
             path = cmd[len(":export "):].strip()
@@ -444,11 +573,25 @@ def main():
             count = tok.export_word_db(path)
             print(f"  Exported {count} words to {path}\n")
             continue
+        if cmd == ":score":
+            if last_encoding is None:
+                print("  No text encoded yet. Type a line to encode and score it.\n")
+                continue
+            res = tok.score_encoding(last_encoding)
+            print(f"  Deterministic normalized score: {res['normalized_score']:.1f}/100")
+            print("  Top categories:")
+            for c, v in res['category_breakdown'][:10]:
+                print(f"    {c}: {v:.1f}")
+            print()
+            continue
         if not text:
             continue
-        show(tok.encode(text))
+        enc = tok.encode(text)
+        last_encoding = enc
+        show(enc)
     if args.vocab:
         tok.save(args.vocab)
+        tok.save_phrase_freq(phrase_freq_path)
 
 
 if __name__ == "__main__":

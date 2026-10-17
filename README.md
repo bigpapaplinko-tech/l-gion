@@ -2,33 +2,11 @@
 Ummm stop lookin at ts its privete
 
 This project is centered on building a resume-focused keyword database and scoring pipeline.
-The goal is to tokenize resumes and job descriptions, track word and phrase signals, and estimate how well a candidate matches a target role based on weighted vocabulary and job-fit data.
 
-## Current state
-- `tokenizer.py` is the main tool for character and word tokenization.
-- `keyword_scorer.py` remains as a simpler prototype for keyword value scoring.
-- We now include starter data files to make it easier to build the database without starting from scratch.
+## Current state (summary)
+We have a working tokenizer and bootstrapped vocabulary with:
+- word list, degree lexicon, categories, and weights
+- phrase (n-gram) extraction and phrase frequency counters (ingest support)
+- deterministic, pre-AI scoring engine that returns a normalized 0-100 score plus per-category breakdown
 
-## Improvements added
-- Added `words.txt` with a starter list of common resume and technical terms.
-- Added `degrees.json` with sample positive and negative keyword signals.
-- Added `categories.json` to group words into domain categories.
-- Added `weights.json` to tune per-word importance.
-- Updated `tokenizer.py` to:
-  - track degree-only words separately from dictionary words
-  - improve stats reporting for auto-registered and degree-only words
-  - add interactive commands: `:help`, `:words`, `:lexicon`, and `:export PATH`
-  - support exporting a JSON word database for downstream analysis
-  - support phrase extraction (n-grams) and repeat-based weighting
-- Documented the current direction and the planned scoring pipeline in `CHANGELOG.md`.
-
-## Run locally
-```bash
-python tokenizer.py
-python tokenizer.py --words words.txt --degrees degrees.json --categories categories.json --weights weights.json --vocab vocab.json --phrases --min-ngram 2 --max-ngram 4
-python keyword_scorer.py
-python keyword_scorer.py --lexicon my.json
-```
-
-## Notes
-The current scoring model is intentionally simple and uses placeholder character values plus word degrees and weights. This keeps the project flexible while we build a larger, more grounded word and phrase database from real resume data and job postings.
+Next recommended steps: collect resume/job corpora via `:ingest`, tune max_value/max_degree for normalization using observed data, and add CI/tests for the full pipeline.
