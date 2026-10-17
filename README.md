@@ -12,20 +12,23 @@ The goal is to tokenize resumes and job descriptions, track word and phrase sign
 ## Improvements added
 - Added `words.txt` with a starter list of common resume and technical terms.
 - Added `degrees.json` with sample positive and negative keyword signals.
+- Added `categories.json` to group words into domain categories.
+- Added `weights.json` to tune per-word importance.
 - Updated `tokenizer.py` to:
   - track degree-only words separately from dictionary words
   - improve stats reporting for auto-registered and degree-only words
   - add interactive commands: `:help`, `:words`, `:lexicon`, and `:export PATH`
   - support exporting a JSON word database for downstream analysis
+  - support phrase extraction (n-grams) and repeat-based weighting
 - Documented the current direction and the planned scoring pipeline in `CHANGELOG.md`.
 
 ## Run locally
 ```bash
 python tokenizer.py
-python tokenizer.py --words words.txt --degrees degrees.json --vocab vocab.json
+python tokenizer.py --words words.txt --degrees degrees.json --categories categories.json --weights weights.json --vocab vocab.json --phrases --min-ngram 2 --max-ngram 4
 python keyword_scorer.py
 python keyword_scorer.py --lexicon my.json
 ```
 
 ## Notes
-The current scoring model is intentionally simple and uses placeholder character values plus word degrees. This keeps the project flexible while we build a larger, more grounded word and phrase database from real resume data and job postings.
+The current scoring model is intentionally simple and uses placeholder character values plus word degrees and weights. This keeps the project flexible while we build a larger, more grounded word and phrase database from real resume data and job postings.

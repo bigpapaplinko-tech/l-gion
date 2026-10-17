@@ -1,28 +1,17 @@
 #!/usr/bin/env python3
 """Token library: every character and every word gets a unique ID and a value.
 
-Layers
-  1. Character tokens: all printable ASCII + newline/tab get IDs up front.
-     Any other character (accents, emoji, other scripts) is registered the
-     first time it shows up, so nothing typed is ever dropped.
-  2. Word tokens: words come from a word list you load (one per line). Any word
-     not in the list is registered on the fly, so coverage is always complete.
-  3. Values: a word's value is the sum of its character values.
-     Separately, a word can carry a "degree" from -3 to +3 (the +/- keyword
-     signal from the scorer). Unlisted words have degree 0.
+This version adds:
+- category loading (words -> categories)
+- optional phrase (n-gram) extraction and registration
+- per-word weight multipliers and repeat-based weighting
+- export includes categories, weights, and phrase flags
 
 Run:
     python tokenizer.py
-    python tokenizer.py --words words.txt --degrees degrees.json --vocab vocab.json
+    python tokenizer.py --words words.txt --degrees degrees.json --categories categories.json --weights weights.json --vocab vocab.json --phrases --min-ngram 2 --max-ngram 4 --repeat-bonus 0.1 --phrase-boost 1.5
 
-Files
-  words.txt        one word per line (supply a full dictionary here)
-  degrees.json     {"led": 2, "fired": -3}
-  vocab.json       saved IDs so they stay stable between runs (--vocab loads it
-                   if it exists and :save writes it)
-  char values      edit default_char_value() or put "char_values" in vocab.json
-
-Prompt commands: :help :stats :words :lexicon :save :export PATH :quit
+Interactive commands: :help :stats :words :lexicon :save :export PATH :quit
 """
 
 import argparse
@@ -32,6 +21,7 @@ import re
 import string
 import sys
 from dataclasses import dataclass, field
+from collections import Counter
 
 MIN_DEGREE, MAX_DEGREE = -3, 3
 PAD = "<PAD>"
@@ -58,17 +48,19 @@ class WordToken:
     text: str
     id: int
     char_ids: list
-    value: int
+    value: float
     degree: int
     known: bool  # True if the word came from the loaded word list
+    is_phrase: bool = False
+    weight: float = 1.0
 
 
 @dataclass
 class Encoding:
     char_ids: list                      # every character of the input, in order
-    words: list = field(default_factory=list)
-    total_value: int = 0                # sum of word values
-    total_degree: int = 0               # sum of +/- degrees
+    words: list = field(default_factory=list)  # list[WordToken]
+    total_value: float = 0.0            # weighted sum of token values
+    total_degree: float = 0             # sum of token degrees (weighted by weight)
     new_words: int = 0                  # words registered during this call
 
     def to_ai_payload(self):
@@ -76,7 +68,14 @@ class Encoding:
         return {
             "char_ids": self.char_ids,
             "words": [
-                {"word": w.text, "id": w.id, "value": w.value, "degree": w.degree}
+                {
+                    "word": w.text,
+                    "id": w.id,
+                    "value": w.value,
+                    "degree": w.degree,
+                    "is_phrase": w.is_phrase,
+                    "weight": w.weight,
+                }
                 for w in self.words
             ],
             "total_value": self.total_value,
@@ -92,6 +91,14 @@ class Tokenizer:
         self.degree_words = set()
         self.char_values = {}   # overrides for default_char_value
         self.degrees = {}
+        self.categories = {}    # word -> [categories]
+        self.weights = {}       # word -> multiplier (float)
+        # phrase settings (not persisted as runtime config)
+        self.phrases_enabled = False
+        self.min_ngram = 2
+        self.max_ngram = 4
+        self.repeat_bonus = 0.1
+        self.phrase_boost = 1.5
         for ch in BASE_CHARS:
             self.char_id(ch)
 
@@ -116,6 +123,7 @@ class Tokenizer:
         return self.word_to_id[key]
 
     def word_value(self, word):
+        # default word value: sum of character values of the word (casefolded)
         return sum(self.char_value(c) for c in word.casefold())
 
     def load_words(self, path):
@@ -140,6 +148,32 @@ class Tokenizer:
             self.word_id(word)
             self.degree_words.add(key)
 
+    def load_categories(self, path):
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        for word, cats in raw.items():
+            key = word.casefold()
+            if isinstance(cats, str):
+                cats = [cats]
+            if not isinstance(cats, (list, tuple)):
+                raise ValueError(f"Categories for '{word}' must be a string or list, got {cats!r}")
+            self.categories[key] = [str(c) for c in cats]
+            self.word_id(word)
+
+    def load_weights(self, path):
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        for word, value in raw.items():
+            try:
+                v = float(value)
+            except Exception:
+                raise ValueError(f"Weight for '{word}' must be numeric, got {value!r}")
+            key = word.casefold()
+            if v <= 0:
+                raise ValueError(f"Weight for '{word}' must be > 0, got {v}")
+            self.weights[key] = v
+            self.word_id(word)
+
     def export_word_db(self, path):
         rows = []
         for word in sorted(self.word_to_id):
@@ -152,14 +186,31 @@ class Tokenizer:
                 "degree": self.degrees.get(word, 0),
                 "known": word in self.seed_words,
                 "degree_only": word in self.degree_words and word not in self.seed_words,
+                "categories": self.categories.get(word, []),
+                "weight": self.weights.get(word, 1.0),
             })
         with open(path, "w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False, indent=2)
         return len(rows)
 
     # ---- encoding ----
-    def encode(self, text):
+    def encode(self, text, *, phrases=None, min_ngram=None, max_ngram=None, repeat_bonus=None, phrase_boost=None):
+        """Encode text into character ids and word/phrase tokens. Returns Encoding.
+
+        Optional parameters override tokenizer defaults for this call.
+        If phrases=True, n-gram phrases (min_ngram..max_ngram) are extracted and registered.
+        """
+        # runtime settings
+        phrases_enabled = self.phrases_enabled if phrases is None else bool(phrases)
+        min_n = self.min_ngram if min_ngram is None else int(min_ngram)
+        max_n = self.max_ngram if max_ngram is None else int(max_ngram)
+        repeat_b = self.repeat_bonus if repeat_bonus is None else float(repeat_bonus)
+        p_boost = self.phrase_boost if phrase_boost is None else float(phrase_boost)
+
         enc = Encoding(char_ids=[self.char_id(ch) for ch in text])
+        word_texts = []  # preserve sequence of word keys
+
+        # extract words and create word tokens
         for m in WORD_RE.finditer(text):
             raw = m.group(0)
             key = raw.casefold()
@@ -174,10 +225,54 @@ class Tokenizer:
                 value=self.word_value(key),
                 degree=self.degrees.get(key, 0),
                 known=key in self.seed_words,
+                is_phrase=False,
+                weight=self.weights.get(key, 1.0),
             )
             enc.words.append(tok)
-            enc.total_value += tok.value
-            enc.total_degree += tok.degree
+            word_texts.append(key)
+
+        # optional phrase extraction (n-grams)
+        if phrases_enabled and word_texts:
+            n_words = len(word_texts)
+            for n in range(min_n, min(max_n, n_words) + 1):
+                for i in range(0, n_words - n + 1):
+                    parts = word_texts[i : i + n]
+                    phrase_text = " ".join(parts)
+                    pkey = phrase_text.casefold()
+                    is_new = pkey not in self.word_to_id
+                    wid = self.word_id(phrase_text)
+                    if is_new:
+                        enc.new_words += 1
+                    # phrase value: sum of component values * phrase_boost
+                    comp_values = sum(self.word_value(w) for w in parts)
+                    phrase_value = comp_values * p_boost
+                    tok = WordToken(
+                        text=pkey,
+                        id=wid,
+                        char_ids=[self.char_id(c) for c in pkey],
+                        value=phrase_value,
+                        degree=self.degrees.get(pkey, 0),
+                        known=pkey in self.seed_words,
+                        is_phrase=True,
+                        weight=self.weights.get(pkey, 1.0) * p_boost,
+                    )
+                    enc.words.append(tok)
+
+        # compute frequency-based multipliers and totals
+        counts = Counter(w.text for w in enc.words)
+        total_value = 0.0
+        total_degree = 0
+        for w in enc.words:
+            freq = counts[w.text]
+            repeat_multiplier = 1.0 + repeat_b * (freq - 1)
+            multiplier = w.weight * repeat_multiplier
+            total_value += w.value * multiplier
+            # degrees are integer signals; apply weight multiplier when summing to allow intensity
+            total_degree += int(round(w.degree * multiplier))
+            # store effective weight for reporting/debugging
+            w.weight = multiplier
+        enc.total_value = total_value
+        enc.total_degree = total_degree
         return enc
 
     # ---- persistence ----
@@ -189,6 +284,8 @@ class Tokenizer:
             "degree_words": sorted(self.degree_words),
             "char_values": self.char_values,
             "degrees": self.degrees,
+            "categories": self.categories,
+            "weights": self.weights,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
@@ -204,12 +301,16 @@ class Tokenizer:
         t.degree_words = set(data.get("degree_words", []))
         t.char_values = data.get("char_values", {})
         t.degrees = data.get("degrees", {})
+        t.categories = data.get("categories", {})
+        t.weights = {k: float(v) for k, v in data.get("weights", {}).items()}
         return t
 
     def stats(self):
         total_words = len(self.word_to_id) - 1
         degree_only = len(self.degree_words - self.seed_words)
         auto = total_words - len(self.seed_words) - degree_only
+        phrase_count = sum(1 for w in self.word_to_id if " " in w)
+        category_terms = len(self.categories)
         return {
             "characters": len(self.char_to_id) - 1,
             "words": total_words,
@@ -217,6 +318,8 @@ class Tokenizer:
             "degree_only": degree_only,
             "auto_registered": auto,
             "degree_words": len(self.degrees),
+            "phrase_terms": phrase_count,
+            "category_terms": category_terms,
         }
 
 
@@ -228,19 +331,27 @@ def show(enc):
     width = max(len(w.text) for w in enc.words)
     for w in enc.words:
         tag = "" if w.known else "  *auto"
-        print(f"  {w.text:<{width}}  id={w.id:<7} value={w.value:<5} degree={w.degree:+d}{tag}")
-    print(f"\n  total value: {enc.total_value}   total degree: {enc.total_degree:+d}")
+        ptag = "(phrase)" if w.is_phrase else ""
+        print(f"  {w.text:<{width}}  id={w.id:<7} value={w.value:<7.2f} degree={w.degree:+d} weight={w.weight:.2f} {ptag}{tag}")
+    print(f"\n  total value: {enc.total_value:.2f}   total degree: {enc.total_degree:+d}")
     if enc.new_words:
         print(f"  {enc.new_words} new word(s) registered (*auto = not in the word list)")
     print()
 
 
 def main():
-    p = argparse.ArgumentParser(description="Character + word token library")
+    p = argparse.ArgumentParser(description="Character + word token library with phrase and weighting support")
     p.add_argument("--words", help="word list file, one word per line")
     p.add_argument("--degrees", help="JSON of word -> degree (-3..+3)")
+    p.add_argument("--categories", help="JSON of word -> category or [categories]")
+    p.add_argument("--weights", help="JSON of word -> multiplier (float)")
     p.add_argument("--vocab", help="vocab JSON to load if present and to write on :save")
     p.add_argument("--export", help="path to export the current word database as JSON")
+    p.add_argument("--phrases", action="store_true", help="enable phrase (n-gram) extraction and registration")
+    p.add_argument("--min-ngram", type=int, default=2, help="minimum n for phrase extraction (default 2)")
+    p.add_argument("--max-ngram", type=int, default=4, help="maximum n for phrase extraction (default 4)")
+    p.add_argument("--repeat-bonus", type=float, default=0.1, help="repeat word bonus multiplier per extra occurrence (default 0.1)")
+    p.add_argument("--phrase-boost", type=float, default=1.5, help="phrase value boost multiplier (default 1.5)")
     args = p.parse_args()
 
     try:
@@ -253,9 +364,23 @@ def main():
             print(f"Loaded {n} words from {args.words}")
         if args.degrees:
             tok.load_degrees(args.degrees)
+            print(f"Loaded degree mappings from {args.degrees}")
+        if args.categories:
+            tok.load_categories(args.categories)
+            print(f"Loaded categories from {args.categories}")
+        if args.weights:
+            tok.load_weights(args.weights)
+            print(f"Loaded weights from {args.weights}")
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as e:
         print(f"Could not load: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # apply runtime phrase/weight settings
+    tok.phrases_enabled = bool(args.phrases)
+    tok.min_ngram = args.min_ngram
+    tok.max_ngram = args.max_ngram
+    tok.repeat_bonus = args.repeat_bonus
+    tok.phrase_boost = args.phrase_boost
 
     if args.export:
         count = tok.export_word_db(args.export)
@@ -291,7 +416,9 @@ def main():
                     continue
                 known = "seed" if word in tok.seed_words else "auto"
                 degree = tok.degrees.get(word, 0)
-                print(f"  {word:<20} id={tok.word_to_id[word]:<6} {known:<8} degree={degree:+d}")
+                cats = ",".join(tok.categories.get(word, []))
+                weight = tok.weights.get(word, 1.0)
+                print(f"  {word:<30} id={tok.word_to_id[word]:<6} {known:<6} degree={degree:+d} weight={weight:.2f} cats={cats}")
             print()
             continue
         if cmd in {":lexicon", ":degrees"}:
