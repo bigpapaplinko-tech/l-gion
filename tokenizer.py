@@ -22,7 +22,7 @@ Files
                    if it exists and :save writes it)
   char values      edit default_char_value() or put "char_values" in vocab.json
 
-Prompt commands: :stats  :save  :quit
+Prompt commands: :help :stats :words :lexicon :save :export PATH :quit
 """
 
 import argparse
@@ -89,6 +89,7 @@ class Tokenizer:
         self.char_to_id = {PAD: 0}
         self.word_to_id = {PAD: 0}
         self.seed_words = set()
+        self.degree_words = set()
         self.char_values = {}   # overrides for default_char_value
         self.degrees = {}
         for ch in BASE_CHARS:
@@ -134,8 +135,27 @@ class Tokenizer:
         for word, value in raw.items():
             if not isinstance(value, (int, float)):
                 raise ValueError(f"Degree for '{word}' must be a number, got {value!r}")
-            self.degrees[word.casefold()] = max(MIN_DEGREE, min(MAX_DEGREE, value))
+            key = word.casefold()
+            self.degrees[key] = max(MIN_DEGREE, min(MAX_DEGREE, value))
             self.word_id(word)
+            self.degree_words.add(key)
+
+    def export_word_db(self, path):
+        rows = []
+        for word in sorted(self.word_to_id):
+            if word == PAD:
+                continue
+            rows.append({
+                "word": word,
+                "id": self.word_to_id[word],
+                "value": self.word_value(word),
+                "degree": self.degrees.get(word, 0),
+                "known": word in self.seed_words,
+                "degree_only": word in self.degree_words and word not in self.seed_words,
+            })
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+        return len(rows)
 
     # ---- encoding ----
     def encode(self, text):
@@ -166,6 +186,7 @@ class Tokenizer:
             "char_to_id": self.char_to_id,
             "word_to_id": self.word_to_id,
             "seed_words": sorted(self.seed_words),
+            "degree_words": sorted(self.degree_words),
             "char_values": self.char_values,
             "degrees": self.degrees,
         }
@@ -180,16 +201,21 @@ class Tokenizer:
         t.char_to_id = data["char_to_id"]
         t.word_to_id = data["word_to_id"]
         t.seed_words = set(data.get("seed_words", []))
+        t.degree_words = set(data.get("degree_words", []))
         t.char_values = data.get("char_values", {})
         t.degrees = data.get("degrees", {})
         return t
 
     def stats(self):
+        total_words = len(self.word_to_id) - 1
+        degree_only = len(self.degree_words - self.seed_words)
+        auto = total_words - len(self.seed_words) - degree_only
         return {
             "characters": len(self.char_to_id) - 1,
-            "words": len(self.word_to_id) - 1,
+            "words": total_words,
             "from_word_list": len(self.seed_words),
-            "auto_registered": len(self.word_to_id) - 1 - len(self.seed_words),
+            "degree_only": degree_only,
+            "auto_registered": auto,
             "degree_words": len(self.degrees),
         }
 
@@ -214,6 +240,7 @@ def main():
     p.add_argument("--words", help="word list file, one word per line")
     p.add_argument("--degrees", help="JSON of word -> degree (-3..+3)")
     p.add_argument("--vocab", help="vocab JSON to load if present and to write on :save")
+    p.add_argument("--export", help="path to export the current word database as JSON")
     args = p.parse_args()
 
     try:
@@ -230,7 +257,11 @@ def main():
         print(f"Could not load: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print("Token library ready. :stats  :save  :quit\n")
+    if args.export:
+        count = tok.export_word_db(args.export)
+        print(f"Exported {count} words to {args.export}")
+
+    print("Token library ready. :help :stats :words :lexicon :save :export PATH :quit\n")
     while True:
         try:
             text = input("> ")
@@ -240,9 +271,35 @@ def main():
         cmd = text.strip()
         if cmd == ":quit":
             break
+        if cmd == ":help":
+            print("  :help         show available commands")
+            print("  :stats        show vocabulary stats")
+            print("  :words        list vocabulary entries")
+            print("  :lexicon      list degree mappings")
+            print("  :save         write vocab file (requires --vocab)")
+            print("  :export PATH  export the current word database to JSON")
+            print("  :quit         exit\n")
+            continue
         if cmd == ":stats":
             for k, v in tok.stats().items():
                 print(f"  {k}: {v}")
+            print()
+            continue
+        if cmd == ":words":
+            for word in sorted(tok.word_to_id):
+                if word == PAD:
+                    continue
+                known = "seed" if word in tok.seed_words else "auto"
+                degree = tok.degrees.get(word, 0)
+                print(f"  {word:<20} id={tok.word_to_id[word]:<6} {known:<8} degree={degree:+d}")
+            print()
+            continue
+        if cmd in {":lexicon", ":degrees"}:
+            if not tok.degrees:
+                print("  (no degree mappings loaded)\n")
+                continue
+            for w, v in sorted(tok.degrees.items(), key=lambda kv: (-kv[1], kv[0])):
+                print(f"  {w:<20} {v:+d}")
             print()
             continue
         if cmd == ":save":
@@ -251,6 +308,14 @@ def main():
             else:
                 tok.save(args.vocab)
                 print(f"  Saved to {args.vocab}\n")
+            continue
+        if cmd.startswith(":export "):
+            path = cmd[len(":export "):].strip()
+            if not path:
+                print("  Usage: :export PATH\n")
+                continue
+            count = tok.export_word_db(path)
+            print(f"  Exported {count} words to {path}\n")
             continue
         if not text:
             continue
