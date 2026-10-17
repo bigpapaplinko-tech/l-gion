@@ -1,0 +1,15 @@
+{
+  "engineering": ["technical", "software"],
+  "python": ["technical", "programming"],
+  "leadership": ["management"],
+  "marketing": ["business", "marketing"],
+  "sales": ["business", "sales"],
+  "sql": ["technical", "data"],
+  "security": ["technical", "security"],
+  "product": ["product"],
+  "project": ["product", "project-management"],
+  "research": ["research"],
+  "ux": ["design"],
+  "testing": ["quality"],
+  "communication": ["soft-skills"]
+}
